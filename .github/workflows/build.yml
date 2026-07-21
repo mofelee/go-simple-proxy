@@ -1,0 +1,81 @@
+name: Build binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            output: simple-proxy-linux-amd64
+            archive: simple-proxy-linux-amd64.tar.gz
+          - goos: linux
+            goarch: arm64
+            output: simple-proxy-linux-arm64
+            archive: simple-proxy-linux-arm64.tar.gz
+          - goos: darwin
+            goarch: amd64
+            output: simple-proxy-darwin-amd64
+            archive: simple-proxy-darwin-amd64.tar.gz
+          - goos: darwin
+            goarch: arm64
+            output: simple-proxy-darwin-arm64
+            archive: simple-proxy-darwin-arm64.tar.gz
+          - goos: windows
+            goarch: amd64
+            output: simple-proxy-windows-amd64.exe
+            archive: simple-proxy-windows-amd64.zip
+          - goos: windows
+            goarch: arm64
+            output: simple-proxy-windows-arm64.exe
+            archive: simple-proxy-windows-arm64.zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.output }}" .
+
+      - name: Package binary
+        run: |
+          mkdir artifacts
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cd dist
+            zip "../artifacts/${{ matrix.archive }}" "${{ matrix.output }}"
+          else
+            tar -C dist -czf "artifacts/${{ matrix.archive }}" "${{ matrix.output }}"
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: artifacts/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
