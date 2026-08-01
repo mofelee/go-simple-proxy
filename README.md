@@ -94,7 +94,7 @@ curl --proxy http://127.0.0.1:8080 --proxy-user 'alice:change-me' https://exampl
 - macOS：amd64、arm64
 - Windows：amd64、arm64
 
-构建结果可从对应 GitHub Actions 运行记录的 Artifacts 中下载。
+构建结果可从对应 GitHub Actions 运行记录的 Artifacts 中下载。推送 `v*` 标签时，工作流还会自动创建 GitHub Release，并附带所有平台归档及 `SHA256SUMS` 校验文件。
 
 ## 安全说明
 
