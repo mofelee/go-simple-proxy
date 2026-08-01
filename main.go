@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -24,10 +24,21 @@ var dialer = &net.Dialer{
 func main() {
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "SOCKS5 listen address; empty disables it")
 	httpAddr := flag.String("http", "127.0.0.1:8080", "HTTP/HTTPS proxy listen address; empty disables it")
+	authUser := flag.String("auth-user", "", "proxy authentication username (or SIMPLE_PROXY_USER)")
+	authPassword := flag.String("auth-password", "", "proxy authentication password (or SIMPLE_PROXY_PASSWORD)")
 	flag.Parse()
 
 	if *socksAddr == "" && *httpAddr == "" {
 		log.Fatal("both SOCKS5 and HTTP proxy are disabled")
+	}
+	username := firstNonEmpty(*authUser, os.Getenv("SIMPLE_PROXY_USER"))
+	password := firstNonEmpty(*authPassword, os.Getenv("SIMPLE_PROXY_PASSWORD"))
+	auth, err := newCredentials(username, password)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if auth.enabled() {
+		log.Print("proxy authentication enabled")
 	}
 
 	errCh := make(chan error, 2)
@@ -35,7 +46,7 @@ func main() {
 	if *socksAddr != "" {
 		go func() {
 			log.Printf("SOCKS5 proxy listening on %s", *socksAddr)
-			errCh <- serveSOCKS5(*socksAddr)
+			errCh <- serveSOCKS5(*socksAddr, auth)
 		}()
 	}
 
@@ -43,8 +54,10 @@ func main() {
 		go func() {
 			log.Printf("HTTP/HTTPS proxy listening on %s", *httpAddr)
 			server := &http.Server{
-				Addr:              *httpAddr,
-				Handler:           http.HandlerFunc(handleHTTPProxy),
+				Addr: *httpAddr,
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					handleHTTPProxy(w, r, auth)
+				}),
 				ReadHeaderTimeout: 10 * time.Second,
 				IdleTimeout:       90 * time.Second,
 			}
@@ -55,7 +68,7 @@ func main() {
 	log.Fatal(<-errCh)
 }
 
-func serveSOCKS5(addr string) error {
+func serveSOCKS5(addr string, auth credentials) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -69,43 +82,18 @@ func serveSOCKS5(addr string) error {
 		}
 		go func() {
 			defer conn.Close()
-			if err := handleSOCKS5(conn); err != nil {
+			if err := handleSOCKS5(conn, auth); err != nil {
 				log.Printf("SOCKS5 %s: %v", conn.RemoteAddr(), err)
 			}
 		}()
 	}
 }
 
-func handleSOCKS5(client net.Conn) error {
+func handleSOCKS5(client net.Conn, auth credentials) error {
 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
 	reader := bufio.NewReader(client)
 
-	// Greeting: VER, NMETHODS, METHODS...
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(reader, header); err != nil {
-		return err
-	}
-	if header[0] != 0x05 {
-		return fmt.Errorf("unsupported SOCKS version: %d", header[0])
-	}
-
-	methods := make([]byte, int(header[1]))
-	if _, err := io.ReadFull(reader, methods); err != nil {
-		return err
-	}
-
-	noAuth := false
-	for _, method := range methods {
-		if method == 0x00 {
-			noAuth = true
-			break
-		}
-	}
-	if !noAuth {
-		_, _ = client.Write([]byte{0x05, 0xff})
-		return errors.New("client does not support no-authentication mode")
-	}
-	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+	if err := negotiateSOCKS5Authentication(reader, client, auth); err != nil {
 		return err
 	}
 
@@ -216,7 +204,11 @@ var transport = &http.Transport{
 	ExpectContinueTimeout: 1 * time.Second,
 }
 
-func handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
+func handleHTTPProxy(w http.ResponseWriter, r *http.Request, auth credentials) {
+	if !authenticateHTTPProxy(w, r, auth) {
+		return
+	}
+
 	if r.Method == http.MethodConnect {
 		handleConnect(w, r)
 		return

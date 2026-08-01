@@ -13,8 +13,25 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run tests
+        run: go test -race ./...
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
