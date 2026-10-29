@@ -54,6 +54,30 @@ SIMPLE_PROXY_PASSWORD='change-me' \
 
 两项都未配置时不启用鉴权，以保持默认的本机免认证用法。
 
+## 访问控制与空闲超时
+
+限制允许连接代理的客户端 IP（逗号分隔，支持单个 IP 和 CIDR；为空时允许所有客户端）：
+
+```bash
+./simple-proxy -allow-clients '127.0.0.1,10.0.0.0/8'
+```
+
+禁止通过代理访问本机、内网、链路本地（包括云厂商元数据地址 `169.254.169.254`）、CGNAT（`100.64.0.0/10`）、组播和未指定地址。检查发生在 DNS 解析之后，因此解析到内网地址的域名同样会被拒绝；对 SOCKS5 UDP 转发同样生效：
+
+```bash
+./simple-proxy -deny-private
+```
+
+被拒绝时，SOCKS5 返回 `0x02`（规则集不允许），HTTP/HTTPS 代理返回 `403`。
+
+隧道（SOCKS5 CONNECT、HTTP CONNECT 和 SOCKS5 UDP 关联）在两个方向都没有流量超过空闲超时后会被关闭，默认 5 分钟，设为 `0` 可禁用：
+
+```bash
+./simple-proxy -idle-timeout 10m
+```
+
+对外暴露代理时，建议同时启用鉴权、`-allow-clients` 和 `-deny-private`。
+
 ## 测试
 
 SOCKS5：

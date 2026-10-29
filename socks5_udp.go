@@ -10,8 +10,10 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +30,8 @@ type udpAssociation struct {
 	clientConn *net.UDPConn
 	targetConn *net.UDPConn
 	clientIP   netip.Addr
+
+	lastActivity atomic.Int64 // UnixNano of the last datagram in either direction
 
 	mu         sync.Mutex
 	clientAddr netip.AddrPort              // locked to the first valid client datagram
@@ -80,13 +84,46 @@ func handleSOCKS5UDPAssociate(client net.Conn, control *bufio.Reader) error {
 		clientIP:   clientIP.Unmap(),
 		targets:    make(map[netip.AddrPort]struct{}),
 	}
-	go assoc.relayFromClient()
-	go assoc.relayFromTargets()
+	assoc.lastActivity.Store(time.Now().UnixNano())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		assoc.relayFromClient()
+	}()
+	go func() {
+		defer wg.Done()
+		assoc.relayFromTargets()
+	}()
 
 	// RFC 1928: the association ends when the TCP control connection closes.
-	_, _ = io.Copy(io.Discard, control)
+	assoc.waitForControlClose(client, control)
+	clientConn.Close()
+	targetConn.Close()
+	wg.Wait()
 	log.Printf("SOCKS5 UDP %s association closed", client.RemoteAddr())
 	return nil
+}
+
+// waitForControlClose blocks until the control connection closes, or until
+// no datagram has been relayed for idleTimeout.
+func (a *udpAssociation) waitForControlClose(client net.Conn, control *bufio.Reader) {
+	if idleTimeout <= 0 {
+		_, _ = io.Copy(io.Discard, control)
+		return
+	}
+
+	buf := make([]byte, 512)
+	for {
+		_ = client.SetReadDeadline(time.Now().Add(idleTimeout))
+		_, err := control.Read(buf)
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrDeadlineExceeded) && idleSince(&a.lastActivity) < idleTimeout:
+		default:
+			return
+		}
+	}
 }
 
 func (a *udpAssociation) relayFromClient() {
@@ -112,6 +149,11 @@ func (a *udpAssociation) relayFromClient() {
 			continue
 		}
 		dst := unmapAddrPort(targetAddr.AddrPort())
+		if err := checkDestination(dst.Addr()); err != nil {
+			log.Printf("SOCKS5 UDP %s: %v", from, err)
+			continue
+		}
+		a.lastActivity.Store(time.Now().UnixNano())
 
 		a.mu.Lock()
 		a.targets[dst] = struct{}{}
@@ -138,6 +180,8 @@ func (a *udpAssociation) relayFromTargets() {
 		if !known || !clientAddr.IsValid() {
 			continue
 		}
+
+		a.lastActivity.Store(time.Now().UnixNano())
 
 		datagram := appendSOCKSUDPHeader(make([]byte, 0, n+22), from)
 		datagram = append(datagram, buf[:n]...)
