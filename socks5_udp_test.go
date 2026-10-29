@@ -85,7 +85,9 @@ func TestSOCKS5UDPAssociateRelaysDatagrams(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+	handlerDone := make(chan struct{})
 	go func() {
+		defer close(handlerDone)
 		conn, err := ln.Accept()
 		if err != nil {
 			return
@@ -98,7 +100,15 @@ func TestSOCKS5UDPAssociateRelaysDatagrams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer control.Close()
+	// Closing the control connection must end the association.
+	defer func() {
+		control.Close()
+		select {
+		case <-handlerDone:
+		case <-time.After(5 * time.Second):
+			t.Error("UDP association did not end after control connection closed")
+		}
+	}()
 	_ = control.SetDeadline(time.Now().Add(5 * time.Second))
 
 	if _, err := control.Write([]byte{0x05, 0x01, socksNoAuthMethod}); err != nil {

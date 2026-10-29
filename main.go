@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,19 +14,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 var dialer = &net.Dialer{
 	Timeout:   10 * time.Second,
 	KeepAlive: 30 * time.Second,
+	Control:   dialControl,
 }
+
+// idleTimeout closes tunnels with no traffic in either direction for this
+// long. Zero disables it. Set from the -idle-timeout flag.
+var idleTimeout = 5 * time.Minute
 
 func main() {
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "SOCKS5 listen address; empty disables it")
 	httpAddr := flag.String("http", "127.0.0.1:8080", "HTTP/HTTPS proxy listen address; empty disables it")
 	authUser := flag.String("auth-user", "", "proxy authentication username (or SIMPLE_PROXY_USER)")
 	authPassword := flag.String("auth-password", "", "proxy authentication password (or SIMPLE_PROXY_PASSWORD)")
+	allowClients := flag.String("allow-clients", "", "comma-separated client IPs/CIDRs allowed to connect; empty allows all")
+	flag.BoolVar(&denyPrivateDestinations, "deny-private", false, "refuse to proxy to loopback, private, link-local and other non-public addresses")
+	flag.DurationVar(&idleTimeout, "idle-timeout", idleTimeout, "close tunnels idle in both directions for this long; 0 disables")
 	flag.Parse()
 
 	if *socksAddr == "" && *httpAddr == "" {
@@ -40,36 +50,50 @@ func main() {
 	if auth.enabled() {
 		log.Print("proxy authentication enabled")
 	}
+	allowlist, err := parseClientAllowlist(*allowClients)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(allowlist) > 0 {
+		log.Printf("client allowlist: %s", *allowClients)
+	}
+	if denyPrivateDestinations {
+		log.Print("private destinations denied")
+	}
 
 	errCh := make(chan error, 2)
 
 	if *socksAddr != "" {
 		go func() {
 			log.Printf("SOCKS5 proxy listening on %s", *socksAddr)
-			errCh <- serveSOCKS5(*socksAddr, auth)
+			errCh <- serveSOCKS5(*socksAddr, auth, allowlist)
 		}()
 	}
 
 	if *httpAddr != "" {
 		go func() {
 			log.Printf("HTTP/HTTPS proxy listening on %s", *httpAddr)
+			ln, err := listen(*httpAddr, allowlist)
+			if err != nil {
+				errCh <- err
+				return
+			}
 			server := &http.Server{
-				Addr: *httpAddr,
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					handleHTTPProxy(w, r, auth)
 				}),
 				ReadHeaderTimeout: 10 * time.Second,
 				IdleTimeout:       90 * time.Second,
 			}
-			errCh <- server.ListenAndServe()
+			errCh <- server.Serve(ln)
 		}()
 	}
 
 	log.Fatal(<-errCh)
 }
 
-func serveSOCKS5(addr string, auth credentials) error {
-	ln, err := net.Listen("tcp", addr)
+func serveSOCKS5(addr string, auth credentials, allowlist clientAllowlist) error {
+	ln, err := listen(addr, allowlist)
 	if err != nil {
 		return err
 	}
@@ -133,7 +157,11 @@ func handleSOCKS5(client net.Conn, auth credentials) error {
 
 	target, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		_ = writeSOCKSReply(client, 0x05, nil) // Connection refused / general failure
+		reply := byte(0x05) // Connection refused / general failure
+		if errors.Is(err, errDestinationDenied) {
+			reply = 0x02 // Connection not allowed by ruleset
+		}
+		_ = writeSOCKSReply(client, reply, nil)
 		return fmt.Errorf("dial %s: %w", targetAddr, err)
 	}
 	defer target.Close()
@@ -226,22 +254,22 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, auth credentials) {
 		return
 	}
 
+	// A proxy request carries an absolute URL. Forwarding an origin-form
+	// request to r.Host would send it back to this proxy in a loop.
+	if !r.URL.IsAbs() || r.URL.Host == "" {
+		http.Error(w, "not a proxy request: absolute URL required", http.StatusBadRequest)
+		return
+	}
+
 	outReq := r.Clone(context.Background())
 	outReq.RequestURI = ""
 	outReq.Header = r.Header.Clone()
 	removeHopByHopHeaders(outReq.Header)
-
-	if outReq.URL.Scheme == "" {
-		outReq.URL.Scheme = "http"
-	}
-	if outReq.URL.Host == "" {
-		outReq.URL.Host = r.Host
-	}
 	outReq.Host = r.Host
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "proxy error: "+err.Error(), dialErrorStatus(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -262,7 +290,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	target, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		http.Error(w, "connect error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "connect error: "+err.Error(), dialErrorStatus(err))
 		return
 	}
 
@@ -295,12 +323,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	relay(client, target)
 }
 
+func dialErrorStatus(err error) int {
+	if errors.Is(err, errDestinationDenied) {
+		return http.StatusForbidden
+	}
+	return http.StatusBadGateway
+}
+
 func relay(a, b net.Conn) {
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
 	done := make(chan struct{}, 2)
 
 	copyConn := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
-		if tcp, ok := dst.(*net.TCPConn); ok {
+		if err := copyUntilIdle(dst, src, &lastActivity); err != nil {
+			// Idle timeout or broken connection: tear down both directions.
+			_ = a.Close()
+			_ = b.Close()
+		} else if tcp, ok := dst.(*net.TCPConn); ok {
 			_ = tcp.CloseWrite()
 		}
 		done <- struct{}{}
@@ -310,6 +350,41 @@ func relay(a, b net.Conn) {
 	go copyConn(b, a)
 	<-done
 	<-done
+}
+
+// copyUntilIdle copies src to dst until EOF. It fails once neither direction
+// of the tunnel, tracked by lastActivity, has carried data for idleTimeout.
+func copyUntilIdle(dst, src net.Conn, lastActivity *atomic.Int64) error {
+	if idleTimeout <= 0 {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		n, err := src.Read(buf)
+		if n > 0 {
+			lastActivity.Store(time.Now().UnixNano())
+			_ = dst.SetWriteDeadline(time.Now().Add(idleTimeout))
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return err
+			}
+		}
+		switch {
+		case err == nil:
+		case errors.Is(err, io.EOF):
+			return nil
+		case errors.Is(err, os.ErrDeadlineExceeded) && idleSince(lastActivity) < idleTimeout:
+			// The other direction is still active.
+		default:
+			return err
+		}
+	}
+}
+
+func idleSince(lastActivity *atomic.Int64) time.Duration {
+	return time.Since(time.Unix(0, lastActivity.Load()))
 }
 
 func copyHeaders(dst, src http.Header) {
