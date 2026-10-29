@@ -105,9 +105,10 @@ func handleSOCKS5(client net.Conn, auth credentials) error {
 	if request[0] != 0x05 {
 		return fmt.Errorf("invalid request version: %d", request[0])
 	}
-	if request[1] != 0x01 {
+	command := request[1]
+	if command != socksCmdConnect && command != socksCmdUDPAssociate {
 		_ = writeSOCKSReply(client, 0x07, nil) // Command not supported
-		return fmt.Errorf("unsupported command: %d", request[1])
+		return fmt.Errorf("unsupported command: %d", command)
 	}
 
 	host, err := readSOCKSAddress(reader, request[3])
@@ -121,6 +122,13 @@ func handleSOCKS5(client net.Conn, auth credentials) error {
 		return err
 	}
 	port := binary.BigEndian.Uint16(portBytes)
+
+	if command == socksCmdUDPAssociate {
+		// DST.ADDR/DST.PORT is only the client's expected source address,
+		// which is unreliable behind NAT, so it is not used.
+		return handleSOCKS5UDPAssociate(client, reader)
+	}
+
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	target, err := dialer.Dial("tcp", targetAddr)
@@ -173,9 +181,13 @@ func writeSOCKSReply(conn net.Conn, reply byte, bindAddr net.Addr) error {
 	ip := net.IPv4zero
 	port := 0
 
-	if tcpAddr, ok := bindAddr.(*net.TCPAddr); ok {
-		ip = tcpAddr.IP
-		port = tcpAddr.Port
+	switch addr := bindAddr.(type) {
+	case *net.TCPAddr:
+		ip = addr.IP
+		port = addr.Port
+	case *net.UDPAddr:
+		ip = addr.IP
+		port = addr.Port
 	}
 
 	var response []byte

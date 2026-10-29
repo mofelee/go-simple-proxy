@@ -5,7 +5,7 @@
 - SOCKS5 代理：默认 `127.0.0.1:1080`
 - HTTP/HTTPS 代理：默认 `127.0.0.1:8080`
 - 可选的用户名/密码鉴权，同时用于 SOCKS5 和 HTTP/HTTPS 代理
-- SOCKS5 仅支持 CONNECT
+- SOCKS5 支持 CONNECT 和 UDP ASSOCIATE（不支持 BIND 和 UDP 分片）
 - HTTPS 通过 HTTP CONNECT 隧道转发，不解密 TLS
 
 ## 启动
@@ -67,6 +67,8 @@ curl --proxy socks5h://127.0.0.1:1080 https://example.com
 ```bash
 curl --proxy socks5h://127.0.0.1:1080 --proxy-user 'alice:change-me' https://example.com
 ```
+
+SOCKS5 UDP 转发通过 UDP ASSOCIATE 实现，UDP 中继端口随机分配，生命周期与对应的 TCP 控制连接一致。中继只接受来自该 TCP 连接客户端 IP 的数据报，并只回传客户端已发送过数据的目标所返回的数据报。
 
 HTTP：
 
